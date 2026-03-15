@@ -1,110 +1,208 @@
 # CodexUndoRedo
 
-## 面向现代 C++ CAE/PCB 的 Undo/Redo：Immer 实战与事务机制对比
+## C++17 + Qt5.13.1 + OCAF 双系统：面向百万级高速 PCB 多板的 Undo/Redo 事务架构
 
-本文聚焦你给定的 PCB 场景：`Trace` 包含头尾与中间连接类型、网络、线宽和一系列 `Segment`（直线段/弧线段），并讨论在 10w / 100w / 800w 量级下，Immer、OCAF、KLayout 事务机制的性能与内存特性。
+> 目标：保留现有 OCAF 生产体系，同时新增一套高性能低内存的新事务内核（建议基于 Immer 持久化容器），形成 **OCAF + NewCore 双系统架构**。新内核中的参数化变量必须可回映到 OCAF 的总 Label 体系。
 
 ---
 
-## 1) 如何用 Immer 实现 Trace/Via 的新建、删除、修改
+## 1. 约束前提与总体方案
 
-> 核心思路：把 PCB 设计主数据建成 **不可变状态树**（persistent data structure），每次编辑返回一个新版本，Undo/Redo 只是在版本指针间移动。
+你给出的约束非常明确：
 
-### 1.1 数据模型（示例）
+1. 技术栈固定：**C++17、Qt 5.13.1、OCAF**。
+2. 现状：OCAF 在百万级器件下内存压力大。
+3. 要求：新增新框架，但参数变量依旧与 OCAF 总 Label 对齐。
+4. 场景：高速 PCB 多板，含分层对象（Trace/Surface）和跨层对象（Via/BondWire 等）。
+
+### 1.1 推荐架构：双写一致 + 渐进切换
+
+- **LegacyCore（OCAF）**：保留现有业务逻辑与参数化语义。
+- **NewCore（Immer State）**：承载高频编辑、Undo/Redo、并发读。
+- **Bridge（Label 参数桥）**：维护 OCAF Label 与 NewCore ParamId 的双向映射。
+- **SyncPolicy**：按场景选择同步策略：
+  - 交互编辑：NewCore 主写，异步回写 OCAF；
+  - 关键出图/持久化：强一致 flush 到 OCAF。
+
+---
+
+## 2. 参数化变量必须兼容 OCAF Label：如何设计
+
+核心原则：**NewCore 不复制 OCAF 的参数语义，而是引用 OCAF Label 的参数路径作为“参数主键”**。
+
+### 2.1 统一参数主键
+
+```cpp
+// C++17
+using LabelPath = std::string;   // 例如 "0:1:5:18"
+using ParamName = std::string;   // 例如 "x", "y", "width", "drill"
+
+struct ParamKey {
+    LabelPath root_label;   // OCAF 总 Label 或其子树路径
+    ParamName name;         // 参数名
+
+    bool operator==(const ParamKey& r) const {
+        return root_label == r.root_label && name == r.name;
+    }
+};
+```
+
+> 生产实现中建议把 `LabelPath` 编码为压缩整数路径，减少字符串开销。
+
+### 2.2 参数值表达式（支持参数化）
+
+```cpp
+#include <variant>
+#include <vector>
+#include <cstdint>
+
+struct LiteralDouble { double v{}; };
+struct RefParam { ParamKey key; }; // 引用 OCAF 参数
+
+enum class BinOp : std::uint8_t { Add, Sub, Mul, Div };
+
+struct Expr;
+struct BinaryExpr {
+    BinOp op;
+    std::shared_ptr<Expr> lhs;
+    std::shared_ptr<Expr> rhs;
+};
+
+struct Expr {
+    std::variant<LiteralDouble, RefParam, BinaryExpr> node;
+};
+```
+
+这样 `Trace/Via/BondWire` 的坐标、尺寸都可写成表达式：
+- 绝对值：`LiteralDouble{10.0}`
+- 参数引用：`RefParam{ {"0:1:5", "board_thickness"} }`
+- 参数计算：`drill = ref("via_base") * 0.8`
+
+### 2.3 OCAF/NewCore 双向同步
+
+- **OCAF -> NewCore**：监听 Label 参数变更，增量更新 NewCore 参数缓存。
+- **NewCore -> OCAF**：事务提交时输出 ParamDelta（变更键值对），批量回写 Label。
+- **冲突规则**：按版本戳（`ocaf_rev`, `newcore_rev`）做乐观冲突检测。
+
+---
+
+## 3. 数据分层：哪些对象可以“像 KLayout 一样按层管理”？
+
+结论：**可分层，但要分“几何层”和“逻辑层”**。
+
+### 3.1 适合强分层的数据（几何主导）
+
+1. **Trace（走线）**：天然属于某导体层。
+2. **Surface（铜皮）**：层内区域对象。
+3. **Keepout / Text / Region**：通常层内独立。
+
+这部分可参考 KLayout 的层组织方式：
+- 容器按 `LayerId -> ObjectMap` 管理；
+- 层可独立加载、独立重建索引、独立渲染。
+
+### 3.2 不应只按层管理的数据（跨层/复合语义）
+
+1. **Via（pad + drill）**：几何跨层，且和网络、电气规则强耦合。
+2. **BondWire**：连接跨器件，可能跨层/跨封装语义。
+3. **DiffPair / NetClass 约束对象**：逻辑关系优先。
+4. **器件实例（含 3D 封装）**：通常需要板级/装配级层次管理。
+
+### 3.3 推荐：二维索引模型（LayerIndex + RelationIndex）
+
+- **LayerIndex（按层）**：服务几何查询、渲染、局部编辑。
+- **RelationIndex（按关系图）**：服务网络、约束、器件连接。
+
+任何对象至少落一个主索引：
+- Trace/Surface：LayerIndex 为主，RelationIndex 为辅。
+- Via/BondWire：RelationIndex 为主，LayerIndex 为辅（仅存可见几何切片）。
+
+---
+
+## 4. C++17 + Immer 的事务实现示例（Trace/Via）
+
+> 说明：以下代码偏架构示意，重点体现可落地的数据组织方式和 Undo/Redo 语义。
+
+### 4.1 数据结构
 
 ```cpp
 #include <immer/map.hpp>
 #include <immer/vector.hpp>
-#include <immer/box.hpp>
-#include <string>
 #include <variant>
 #include <cstdint>
 
 using Id = std::uint64_t;
+using LayerId = std::uint16_t;
 
-struct Point {
-    double x{};
-    double y{};
-};
+struct P2Expr { Expr x; Expr y; }; // 坐标参数表达式
 
-enum class ConnectKind {
-    HeadPad,     // trace 头部连接 pad/pin
-    TailPad,     // trace 尾部连接 pad/pin
-    MidTee       // 中间 T 连接/分叉连接
-};
-
-struct StraightSeg {
-    Point p0;
-    Point p1;
-};
-
+struct StraightSeg { P2Expr p0; P2Expr p1; };
 struct ArcSeg {
-    Point center;
-    double radius{};
-    double a0{}; // start angle
-    double a1{}; // end angle
+    P2Expr center;
+    Expr radius;
+    Expr a0;
+    Expr a1;
     bool cw{};
 };
-
 using Segment = std::variant<StraightSeg, ArcSeg>;
 
 struct Trace {
     Id id{};
     Id net_id{};
-    double width{};
-    ConnectKind head_conn{ConnectKind::HeadPad};
-    ConnectKind tail_conn{ConnectKind::TailPad};
+    LayerId layer{};
+    Expr width;                          // 宽度支持参数表达式
     immer::vector<Segment> segments;
+    ParamKey owner_label;                // 对应 OCAF Label 根
 };
 
 struct Via {
     Id id{};
     Id net_id{};
-    Point pos;
-    double drill{};
-    double diameter{};
+    P2Expr pos;
+    Expr drill;
+    Expr diameter;
+    ParamKey owner_label;
 };
 
-struct PcbState {
-    // 主数据：trace/via/net 关系（这里只简化）
+struct BoardState {
+    // 几何层索引（示意：layer->traceIds）
+    immer::map<LayerId, immer::vector<Id>> layer_traces;
+
+    // 主对象表
     immer::map<Id, Trace> traces;
     immer::map<Id, Via> vias;
+
+    // 参数缓存（key -> 当前求值结果）
+    immer::map<std::string, double> param_cache;
 };
 ```
 
-### 1.2 事务与历史栈
+### 4.2 Undo/Redo 历史
 
 ```cpp
 #include <vector>
-#include <stdexcept>
 
 struct History {
-    std::vector<PcbState> undo_stack;
-    std::vector<PcbState> redo_stack;
-    PcbState current;
+    std::vector<BoardState> undo_stack;
+    std::vector<BoardState> redo_stack;
+    BoardState current;
 
-    explicit History(PcbState init) : current(std::move(init)) {}
-
-    template <typename F>
-    void commit(F&& mutator) {
-        auto next = mutator(current); // 返回新状态
+    template <class F>
+    void commit(F&& f) {
+        BoardState next = f(current);
         undo_stack.push_back(current);
         current = std::move(next);
         redo_stack.clear();
     }
 
-    bool can_undo() const { return !undo_stack.empty(); }
-    bool can_redo() const { return !redo_stack.empty(); }
-
     void undo() {
-        if (!can_undo()) throw std::runtime_error("nothing to undo");
+        if (undo_stack.empty()) return;
         redo_stack.push_back(current);
         current = undo_stack.back();
         undo_stack.pop_back();
     }
 
     void redo() {
-        if (!can_redo()) throw std::runtime_error("nothing to redo");
+        if (redo_stack.empty()) return;
         undo_stack.push_back(current);
         current = redo_stack.back();
         redo_stack.pop_back();
@@ -112,199 +210,167 @@ struct History {
 };
 ```
 
-### 1.3 新建 Trace
+### 4.3 Trace 新建/删除/修改（含层索引维护）
 
 ```cpp
-auto add_trace(const PcbState& s, Trace t) {
-    if (s.traces.find(t.id) != nullptr) {
-        throw std::runtime_error("trace id exists");
+BoardState add_trace(const BoardState& s, Trace t) {
+    BoardState n = s;
+    n.traces = n.traces.set(t.id, t);
+
+    auto ids = n.layer_traces.find(t.layer)
+        ? *n.layer_traces.find(t.layer)
+        : immer::vector<Id>{};
+    ids = ids.push_back(t.id);
+    n.layer_traces = n.layer_traces.set(t.layer, ids);
+    return n;
+}
+
+BoardState remove_trace(const BoardState& s, Id trace_id) {
+    auto p = s.traces.find(trace_id);
+    if (!p) return s;
+
+    BoardState n = s;
+    const auto& tr = *p;
+
+    // 从主表删除
+    n.traces = n.traces.erase(trace_id);
+
+    // 从层索引删除（线性示例，生产建议二级索引）
+    auto ids_ptr = n.layer_traces.find(tr.layer);
+    if (ids_ptr) {
+        auto ids = *ids_ptr;
+        immer::vector<Id> out;
+        for (auto id : ids) if (id != trace_id) out = out.push_back(id);
+        n.layer_traces = n.layer_traces.set(tr.layer, out);
     }
-    auto next = s;
-    next.traces = next.traces.set(t.id, std::move(t));
-    return next;
+    return n;
 }
-```
 
-### 1.4 删除 Trace
-
-```cpp
-auto remove_trace(const PcbState& s, Id trace_id) {
-    if (s.traces.find(trace_id) == nullptr) {
-        return s; // 无操作
-    }
-    auto next = s;
-    next.traces = next.traces.erase(trace_id);
-    return next;
-}
-```
-
-### 1.5 修改 Trace（线宽、网络、segment 编辑）
-
-```cpp
-auto update_trace_width(const PcbState& s, Id trace_id, double new_width) {
+BoardState update_trace_width(const BoardState& s, Id trace_id, Expr new_width) {
     auto p = s.traces.find(trace_id);
-    if (!p) throw std::runtime_error("trace not found");
+    if (!p) return s;
 
     auto tr = *p;
-    tr.width = new_width;
+    tr.width = std::move(new_width);
 
-    auto next = s;
-    next.traces = next.traces.set(trace_id, std::move(tr));
-    return next;
-}
-
-auto append_straight_seg(const PcbState& s, Id trace_id, StraightSeg seg) {
-    auto p = s.traces.find(trace_id);
-    if (!p) throw std::runtime_error("trace not found");
-
-    auto tr = *p;
-    tr.segments = tr.segments.push_back(Segment{seg});
-
-    auto next = s;
-    next.traces = next.traces.set(trace_id, std::move(tr));
-    return next;
-}
-
-auto replace_segment(const PcbState& s, Id trace_id, std::size_t idx, Segment seg) {
-    auto p = s.traces.find(trace_id);
-    if (!p) throw std::runtime_error("trace not found");
-
-    auto tr = *p;
-    if (idx >= tr.segments.size()) throw std::runtime_error("segment index out of range");
-
-    tr.segments = tr.segments.set(idx, std::move(seg));
-
-    auto next = s;
-    next.traces = next.traces.set(trace_id, std::move(tr));
-    return next;
+    BoardState n = s;
+    n.traces = n.traces.set(trace_id, std::move(tr));
+    return n;
 }
 ```
 
-### 1.6 使用方式（对应新建/删除/修改）
+### 4.4 OCAF 回写（事务提交后）
 
 ```cpp
-History hist{PcbState{}};
+struct ParamDelta { std::string key; double value; };
+using ParamDeltaList = std::vector<ParamDelta>;
 
-// 1) 新建 trace
-hist.commit([&](const PcbState& s) {
-    Trace t;
-    t.id = 1001;
-    t.net_id = 88;
-    t.width = 0.15;
-    t.head_conn = ConnectKind::HeadPad;
-    t.tail_conn = ConnectKind::TailPad;
-    t.segments = t.segments.push_back(Segment{StraightSeg{{0,0},{10,0}}});
-    t.segments = t.segments.push_back(Segment{ArcSeg{{10,5},5,270,180,true}});
-    return add_trace(s, std::move(t));
-});
-
-// 2) 修改 width
-hist.commit([&](const PcbState& s) {
-    return update_trace_width(s, 1001, 0.20);
-});
-
-// 3) 删除 trace
-hist.commit([&](const PcbState& s) {
-    return remove_trace(s, 1001);
-});
-
-// Undo / Redo
-hist.undo();
-hist.redo();
+// 伪代码：把 NewCore 已提交状态中变更参数批量写回 OCAF Label
+void flush_to_ocaf(const ParamDeltaList& deltas) {
+    // Qt5.13.1 工程中可放在专用工作线程，最终 UI 通知走 signal/slot
+    // for (const auto& d : deltas) {
+    //    TDF_Label label = resolve_label(d.key);
+    //    set_ocaf_real_attribute(label, d.value);
+    // }
+}
 ```
 
-### 1.7 面向百万级规模的关键落地点
+---
 
-1. **大对象不要整体复制**：Immer 的结构共享能避免深拷贝，但你的 `Trace` 结构体仍要保持“小而稳定”，超大几何缓存应外置（ID 引用）。
-2. **分区化状态**：按板、层、区域切片成多个 map，降低单次写放大。
-3. **批量编辑走单事务**：例如推挤布线一次操作里改变几百条 trace，应聚合成一次 `commit`。
-4. **派生数据不入主历史**：DRC 缓存、三角网格、渲染 BVH 只记录 `dirty`，后台重建。
-5. **快照节流**：每 N 次 commit 做 checkpoint，历史栈其余版本可压缩/分级缓存。
+## 5. Immer 使用注意事项（性能/内存）
+
+下面按“必须做 / 不建议做”给出。
+
+### 5.1 必须做（高收益）
+
+1. **对象瘦身**：`Trace` 里只放必要字段；大缓存（网格、三角化、仿真矩阵）外置到缓存系统。
+2. **分片状态**：按 board/layer/region 分片，不要全板单棵大 map。
+3. **批量事务**：一次交互动作中合并多个小修改，减少版本数量。
+4. **稳定 ID**：64-bit 全局 ID，避免容器搬移导致关联失效。
+5. **派生数据 dirty 化**：Undo/Redo 只回滚主数据，派生缓存重建。
+6. **自定义分配器策略**：结合 arena/池化，减少小对象分配抖动。
+
+### 5.2 不建议做（常见踩坑）
+
+1. 在事务中频繁“读-改-写同对象”数百次（应先局部聚合再一次 set）。
+2. 把超长字符串直接作为热路径键（改为整数键或 intern）。
+3. 把 UI 临时状态塞进主历史（会爆栈并污染撤销语义）。
+4. 不做 checkpoint，导致长历史链回收慢、内存波动大。
+
+### 5.3 Immer 常用容器与 PCB 适配建议
+
+1. `immer::map<K,V>`
+   - 用途：对象主表（trace/via/component）。
+   - 建议：`K` 用整数 ID；`V` 保持轻量。
+
+2. `immer::vector<T>`
+   - 用途：segment 列表、layer 内对象列表。
+   - 建议：对超长 segment 序列做分块（例如 path-chunk）。
+
+3. `immer::set<T>`
+   - 用途：选择集、dirty 对象集合。
+   - 建议：短生命周期集合可和事务外临时容器搭配。
+
+4. `immer::table<K,V>`（哈希表语义）
+   - 用途：高频 key/value 查询。
+   - 建议：若键分布均匀，查询性能更稳。
+
+5. `immer::box<T>`
+   - 用途：共享大对象引用（谨慎使用）。
+   - 建议：用于少量大对象元数据，避免过深复制。
 
 ---
 
-## 2) Immer 在哪些软件中使用过？
+## 6. 与 OCAF / KLayout 方式在 10w、100w、800w 规模的对比（PCB Trace/Via 场景）
 
-结论要务实：**Immer（arximboldi/immer）在工业 EDA/CAE 的公开案例不算多**，它更常见于追求函数式不可变数据结构的 C++ 项目、研究原型、编辑器内核或游戏工具链。原因是很多大型 CAD/EDA 核心历史包袱深，更多采用“可变对象 + 命令日志/增量记录”。
+> 说明：以下为工程实践上的趋势对比，不是绝对 benchmark 数值。
 
-因此建议你的决策方式是：
-- 把 Immer 当做 **核心状态层技术选型**（若团队接受函数式风格）；
-- 先在 trace/via/net 子域试点，再决定是否全面推广到 geometry/kernel 层。
+### 6.1 10w 级
 
----
+- **OCAF**：成熟稳定，集成成本低。
+- **NewCore(Immer)**：编辑撤销语义清晰，响应通常更稳。
+- **KLayout 风格分层**：几何编辑高效，易实现层级可见性管理。
 
-## 3) Immer vs OCAF vs KLayout（PCB trace/via 场景）
+### 6.2 100w 级
 
-> 这里给的是工程上常见趋势对比，具体数值会受数据分布、分区策略、内存分配器、事务粒度影响。
+- **OCAF**：单文档属性/Label 膨胀明显，需强优化。
+- **NewCore(Immer)**：若已分片 + 对象瘦身，内存/撤销体验通常优于“全量深拷贝”模型。
+- **KLayout 风格**：层内仍高效，但 Via/BondWire/约束等跨层语义需要额外关系层。
 
-### 3.1 机制差异
+### 6.3 800w 级
 
-1. **Immer**
-   - 本质：不可变持久化容器 + 结构共享
-   - Undo：版本指针回退
-   - 优点：并发读天然友好、回滚简单
-   - 风险：写路径常数开销较高；对象设计不当会有额外分配成本
-
-2. **OCAF（Open CASCADE）事务/Delta**
-   - 本质：文档对象可变 + Delta 记录
-   - Undo：按 Delta 回滚
-   - 优点：CAD 几何语义强、属性系统成熟
-   - 风险：跨域（PCB 网络关系/仿真）需较多桥接层；调优复杂
-
-3. **KLayout 事务（编辑器命令/数据库变更）**
-   - 本质：偏编辑器工作流的变更记录/撤销
-   - 优点：版图编辑实战成熟、操作语义直接
-   - 风险：若扩展到“多物理场仿真 + 复杂对象关系”，需要额外事务编排
-
-### 3.2 在 10w / 100w / 800w 规模的趋势对比（定性）
-
-| 规模 | Immer | OCAF | KLayout式事务 |
-|---|---|---|---|
-| 10w 对象 | 开发体验好，Undo/Redo 清晰；内存可控 | 稳定，集成几何友好 | 编辑操作响应通常很好 |
-| 100w 对象 | 需分区+对象瘦身；写放大要重点优化 | Delta 管理复杂度上升，但成熟度高 | 取决于你对数据库与命令层改造程度 |
-| 800w 对象 | 若不分层分片会吃紧；需冷热分层/外置大块数据 | 可做但工程成本高；事务链调优难 | 作为基础编辑事务可用，但跨域统一事务需重构 |
-
-### 3.3 性能与内存核心结论（PCB trace/via）
-
-1. **若你追求多线程读取一致性 + 简洁 undo 语义**：Immer 很有吸引力。  
-2. **若你已有重 OCCT/OCAF 体系且几何核心占主导**：延续 OCAF 成本更低。  
-3. **若你已有类似 KLayout 的编辑器内核**：可保留命令事务层，但建议在底层引入“分区快照+结构共享”思想。  
-4. 对 800w 级别，**没有任何机制可以“裸跑”**：必须做分区、延迟加载、派生缓存外置、事务批处理、内存池。  
+- **仅靠 OCAF**：内存与事务成本高，风险大。
+- **仅靠分层几何**：无法覆盖复杂关系一致性。
+- **推荐**：
+  - OCAF 作为参数与持久化语义权威源；
+  - NewCore 作为编辑事务与高频读取内核；
+  - 双索引（Layer + Relation）+ 增量同步 + checkpoint。
 
 ---
 
-## 4) 结合你的场景的推荐落地路线
+## 7. 针对你的场景的最终落地建议
 
-1. **第一阶段（低风险）**：
-   - 保留现有命令式事务接口；
-   - 在 trace/via/net 子域引入 Immer 状态层；
-   - 先打通 Undo/Redo + DRC dirty 传播。
-
-2. **第二阶段（扩展）**：
-   - 把 board 按区块分片（空间分桶/层分桶）；
-   - 引入 checkpoint + redo branch 管理；
-   - 建立大事务（自动布线/批量规则修改）压缩策略。
-
-3. **第三阶段（百万级优化）**：
-   - 热/冷数据拆分，几何细节页式加载；
-   - 仿真/网格派生缓存异步重建；
-   - 事务日志持久化（崩溃恢复 + 回放定位）。
+1. **先做双系统而非一次性替换**：风险最小。
+2. **参数统一到 OCAF Label Key**：保证历史兼容与工程可迁移。
+3. **Trace/Surface 先分层迁移，Via/BondWire 同步建设关系索引**。
+4. **Undo/Redo 以 NewCore 为主，OCAF 做最终一致回写**。
+5. **上线前必须做三档压测**：10w、100w、800w；指标至少包含：
+   - 单次事务延时（P50/P95）
+   - Undo/Redo 延时
+   - 常驻内存与峰值内存
+   - OCAF 回写时延
 
 ---
 
-## 5) 一个 Trace + Via 混合事务例子（语义级）
+## 8. Qt 5.13.1 集成建议（简要）
 
-一次用户动作：
-- 把 `Trace#1001` 的尾部改接 `Via#5002`；
-- 新增一段弧线规避障碍；
-- 线宽从 0.15 改为 0.18；
-- 标记局部 DRC 和阻抗仿真缓存失效。
+1. UI 层（Qt）只发事务请求，不直接写核心状态。
+2. NewCore 在工作线程提交，提交完成发 `signal` 通知视图刷新。
+3. OCAF 回写可异步批处理，关键节点（保存/导出）执行强一致 flush。
+4. 大事务（自动布线）采用进度可取消任务，避免 UI 卡死。
 
-在 Immer 模式中就是一次 `commit`：
-1. 修改 trace 连接类型（tail 从 `TailPad` -> `MidTee`/via 连接语义）；
-2. `segments.push_back(ArcSeg{...})`；
-3. `width=0.18`；
-4. 更新 `via.net_id` 一致性；
-5. 仅记录 `dirty_region_ids`（派生缓存不入主状态）。
+---
 
-Undo 即回退到前一版本指针，所有上述变化原子撤销。
+如果你愿意，下一步我可以继续给你一份：
+- `C++17` 头文件级接口草图（`TransactionCoordinator`、`ParamBridge`、`LayerRelationIndex`）；
+- 一套可直接用于压测 10w/100w/800w 的基准测试模板（含指标采集点）。
